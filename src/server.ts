@@ -240,6 +240,28 @@ aedes.authorizePublish = (client, packet, callback) => {
       return;
     }
     
+    // Admin subscribers (role 1) can publish to serial/commands topics for remote serial access
+    // Topic format: meshcore/{IATA}/{PUBLIC_KEY}/serial/commands
+    if (role === SubscriberRole.ADMIN && packet.topic.endsWith('/serial/commands')) {
+      const parts = packet.topic.split('/');
+      // Validate: meshcore / IATA / PUBLIC_KEY / serial / commands (5 parts)
+      if (parts.length === 5 && parts[0] === 'meshcore' && parts[3] === 'serial') {
+        const iata = parts[1];
+        const publicKey = parts[2];
+        // Basic format validation (real validation happens at meshcoretomqtt via JWT)
+        const isValidIata = /^[A-Z]{3}$/i.test(iata) || iata.toLowerCase() === 'test';
+        const isValidPubKey = /^[0-9A-Fa-f]{64}$/.test(publicKey);
+        if (isValidIata && isValidPubKey) {
+          console.log(`${logPrefix} [AUTHZ] ✓ Admin serial command authorized -> ${packet.topic}`);
+          callback(null);
+          return;
+        }
+      }
+      console.log(`${logPrefix} [AUTHZ] ✗ Serial command denied (invalid topic format) -> ${packet.topic}`);
+      callback(new Error('Invalid serial/commands topic format'));
+      return;
+    }
+    
     console.log(`${logPrefix} [AUTHZ] ✗ Publish denied (subscriber) -> ${packet.topic}`);
     callback(new Error('Subscriber clients are subscribe-only'));
     return;
@@ -279,9 +301,11 @@ aedes.authorizePublish = (client, packet, callback) => {
       return;
     }
     
-    // Allow "test" as a special testing region
-    if (locationCode.toLowerCase() === 'test') {
-      console.log(`${logPrefix} [AUTHZ] ✓ Using TEST region -> ${packet.topic}`);
+    // Check if this is the special "test" region and normalize it to lowercase
+    const isTestRegion = locationCode.toLowerCase() === 'test';
+    
+    if (isTestRegion) {
+      console.log(`${logPrefix} [AUTHZ] ✓ Using test region -> ${packet.topic}`);
       // Continue to validation, don't return here
     } else {
       // First check format (must be 3 uppercase letters, no normalization)
@@ -336,16 +360,40 @@ aedes.authorizePublish = (client, packet, callback) => {
       return;
     }
 
-    // Normalize the topic to UPPERCASE for the public key component
+    // Normalize the topic to UPPERCASE for IATA codes and public key component
     // This prevents duplicate topics with different casing (e.g., 7553b337... vs 7553B337...)
-    // Reconstruct topic with uppercase location code and public key
-    const normalizedLocation = locationCode.toUpperCase();
+    // For the test region, always normalize to lowercase "test"
+    const normalizedLocation = isTestRegion ? 'test' : locationCode.toUpperCase();
     const normalizedTopic = `meshcore/${normalizedLocation}/${clientPublicKey}/${topicParts.slice(3).join('/')}`;
     
     // Update the packet topic to the normalized version
     if (packet.topic !== normalizedTopic) {
       console.log(`${logPrefix} [AUTHZ] Normalized topic: ${packet.topic} -> ${normalizedTopic}`);
       packet.topic = normalizedTopic;
+    }
+
+    // Special handling for serial/responses - payload is a JWT string, not JSON
+    // Topic format: meshcore/{IATA}/{PUBLIC_KEY}/serial/responses
+    const subtopic = topicParts.slice(3).join('/');
+    if (subtopic === 'serial/responses') {
+      const payload = packet.payload.toString('utf-8');
+      // Validate it looks like a JWT (3 base64url parts separated by dots)
+      const jwtParts = payload.split('.');
+      if (jwtParts.length !== 3) {
+        console.log(`${logPrefix} [AUTHZ] ✗ Publish denied -> ${packet.topic} (invalid JWT format)`);
+        callback(new Error('serial/responses payload must be a valid JWT'));
+        return;
+      }
+      // Basic JWT format check - each part should be base64url encoded
+      const base64urlRegex = /^[A-Za-z0-9_-]+$/;
+      if (!jwtParts.every(part => base64urlRegex.test(part))) {
+        console.log(`${logPrefix} [AUTHZ] ✗ Publish denied -> ${packet.topic} (invalid JWT encoding)`);
+        callback(new Error('serial/responses payload must be a valid JWT'));
+        return;
+      }
+      console.log(`${logPrefix} [AUTHZ] ✓ Publish authorized (serial response) -> ${packet.topic}`);
+      callback(null);
+      return;
     }
 
     // Validate that the message contains origin_id matching the authenticated public key
@@ -370,13 +418,13 @@ aedes.authorizePublish = (client, packet, callback) => {
       }
       
       // Track with abuse detector (no enforcement, just tracking)
-      const iata = topicParts[1];
+      // Use normalizedLocation to ensure consistent tracking regardless of case
       
       // Check IATA changes
       const publicKey = (client as any).publicKey;
       const trustState = abuseDetector.getClientStats(publicKey);
       if (trustState) {
-        abuseDetector.checkIataChange(trustState, iata);
+        abuseDetector.checkIataChange(trustState, normalizedLocation);
         
         // Record packet
         abuseDetector.recordPacket(client, packet);
@@ -387,9 +435,8 @@ aedes.authorizePublish = (client, packet, callback) => {
       // Publish JWT payload to /internal topic (ADMIN-only, contains PII)
       const tokenPayload = (client as any).tokenPayload;
       if (tokenPayload) {
-        // Extract location from topic (meshcore/IATA/... or meshcore/IATA/PUBKEY/...)
-        const location = topicParts[1];
-        const internalTopic = `meshcore/${location}/${clientPublicKey}/internal`;
+        // Use normalizedLocation to ensure consistent internal topic naming
+        const internalTopic = `meshcore/${normalizedLocation}/${clientPublicKey}/internal`;
         
         // Get trust state for internal message
         const trustState = abuseDetector.getClientStats(clientPublicKey);
@@ -482,8 +529,23 @@ aedes.authorizeSubscribe = (client, subscription, callback) => {
   const logPrefix = getClientLogPrefix(client);
   const clientType = (client as any).clientType;
   
-  // Publisher clients cannot subscribe (publish-only)
+  // Publisher clients cannot subscribe (publish-only) - EXCEPT their own serial/commands topic
   if (clientType === ClientType.PUBLISHER) {
+    // Allow publishers to subscribe to their own serial/commands topic for remote serial access
+    // Topic format: meshcore/{IATA}/{PUBLIC_KEY}/serial/commands
+    if (subscription.topic.endsWith('/serial/commands')) {
+      const parts = subscription.topic.split('/');
+      if (parts.length === 5 && parts[0] === 'meshcore' && parts[3] === 'serial') {
+        const topicPublicKey = parts[2].toUpperCase();
+        const clientPublicKey = ((client as any).publicKey || '').toUpperCase();
+        // Publisher can only subscribe to their OWN serial/commands topic
+        if (topicPublicKey === clientPublicKey && clientPublicKey.length === 64) {
+          console.log(`${logPrefix} [AUTHZ] ✓ Subscribe authorized (own serial/commands) -> ${subscription.topic}`);
+          callback(null, subscription);
+          return;
+        }
+      }
+    }
     console.log(`${logPrefix} [AUTHZ] ✗ Subscribe denied (publisher) -> ${subscription.topic}`);
     console.log(`${logPrefix} [DISCONNECT] Closing client - Publishers cannot subscribe`);
     callback(new Error('Publisher clients are publish-only'));
@@ -525,6 +587,13 @@ aedes.authorizeForward = (client, packet) => {
   // Critical: Block /internal topics for non-admin subscribers (contains PII)
   if (clientType === ClientType.SUBSCRIBER && role !== SubscriberRole.ADMIN) {
     if (packet.topic.includes('/internal')) {
+      return null; // Block delivery of this message
+    }
+  }
+  
+  // Block /serial/* topics for non-admin subscribers (remote serial access is admin-only)
+  if (clientType === ClientType.SUBSCRIBER && role !== SubscriberRole.ADMIN) {
+    if (packet.topic.includes('/serial/')) {
       return null; // Block delivery of this message
     }
   }
