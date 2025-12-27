@@ -30,6 +30,17 @@ export function loadMqttConfig() {
   };
 }
 
+// Validate and load subscriber configuration
+export function loadSubscriberConfig() {
+  validateRequiredEnvVars([
+    'SUBSCRIBER_MAX_CONNECTIONS_DEFAULT',
+  ]);
+
+  return {
+    defaultMaxConnections: parseInt(process.env.SUBSCRIBER_MAX_CONNECTIONS_DEFAULT!),
+  };
+}
+
 // Validate and load abuse detection configuration
 export function loadAbuseConfig(): AbuseConfig {
   validateRequiredEnvVars([

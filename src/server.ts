@@ -7,11 +7,12 @@ import { getAirportInfo } from 'airport-utils';
 import { RateLimiter } from './rate-limiter';
 import { getClientIP } from './ip-utils';
 import { AbuseDetector } from './abuse-detector';
-import { loadMqttConfig, loadAbuseConfig } from './config';
+import { loadMqttConfig, loadAbuseConfig, loadSubscriberConfig } from './config';
 
 // Load and validate configuration
 const mqttConfig = loadMqttConfig();
 const abuseConfig = loadAbuseConfig();
+const subscriberConfig = loadSubscriberConfig();
 
 const WS_PORT = mqttConfig.wsPort;
 const HOST = mqttConfig.host;
@@ -41,10 +42,15 @@ enum SubscriberRole {
 }
 
 // Load subscriber users from environment variables
-// Format: SUBSCRIBER_1=username:password:role, SUBSCRIBER_2=username:password:role, etc.
+// Format: SUBSCRIBER_1=username:password:role:maxConnections, SUBSCRIBER_2=username:password:role:maxConnections, etc.
 // Role: 1=admin (full+delete), 2=full_access (no hidden data), 3=limited (filtered data)
+// maxConnections: number for override, D or omit to use default
 const subscriberUsers = new Map<string, string>();
 const subscriberRoles = new Map<string, SubscriberRole>();
+const subscriberMaxConnections = new Map<string, number>();
+
+// Track active connections per subscriber username
+const subscriberActiveConnections = new Map<string, Set<string>>();
 
 let subscriberIndex = 1;
 while (true) {
@@ -57,6 +63,7 @@ while (true) {
   const username = parts[0];
   const password = parts[1];
   const roleStr = parts[2];
+  const maxConnStr = parts[3];
   
   if (username && password) {
     subscriberUsers.set(username, password);
@@ -71,12 +78,25 @@ while (true) {
     }
     subscriberRoles.set(username, role);
     
+    // Parse and store max connections (D or empty = default, number = override)
+    let maxConn = subscriberConfig.defaultMaxConnections;
+    if (maxConnStr && maxConnStr.toUpperCase() !== 'D') {
+      const parsedMax = parseInt(maxConnStr);
+      if (!isNaN(parsedMax) && parsedMax > 0) {
+        maxConn = parsedMax;
+      }
+    }
+    subscriberMaxConnections.set(username, maxConn);
+    
+    // Initialize active connections set for this user
+    subscriberActiveConnections.set(username, new Set());
+    
     const roleNames = {
       [SubscriberRole.ADMIN]: 'admin',
       [SubscriberRole.FULL_ACCESS]: 'full_access', 
       [SubscriberRole.LIMITED]: 'limited'
     };
-    console.log(`[CONFIG] Loaded subscriber user: ${username} (role: ${roleNames[role]})`);
+    console.log(`[CONFIG] Loaded subscriber user: ${username} (role: ${roleNames[role]}, maxConnections: ${maxConn})`);
   } else {
     console.warn(`[CONFIG] Invalid format for SUBSCRIBER_${subscriberIndex}: ${subscriberEnvVar}`);
   }
@@ -86,6 +106,8 @@ while (true) {
 
 if (subscriberUsers.size === 0) {
   console.log('[CONFIG] No subscriber users configured');
+} else {
+  console.log(`[CONFIG] Default max connections per subscriber: ${subscriberConfig.defaultMaxConnections}`);
 }
 
 // Create Aedes MQTT broker
@@ -123,8 +145,22 @@ aedes.authenticate = async (client, username, password, callback) => {
     if (subscriberUsers.has(usernameStr)) {
       const expectedPassword = subscriberUsers.get(usernameStr);
       if (passwordStr === expectedPassword) {
+        // Check connection limit before allowing
+        const maxConn = subscriberMaxConnections.get(usernameStr) || subscriberConfig.defaultMaxConnections;
+        const activeConns = subscriberActiveConnections.get(usernameStr) || new Set();
+        
+        if (activeConns.size >= maxConn) {
+          console.log(`${logPrefix} [AUTH] ✗ Subscriber connection limit exceeded (${usernameStr}, ${activeConns.size}/${maxConn})`);
+          callback(null, false);
+          return;
+        }
+        
+        // Track this connection
+        activeConns.add(client.id);
+        subscriberActiveConnections.set(usernameStr, activeConns);
+        
         const role = subscriberRoles.get(usernameStr) || SubscriberRole.LIMITED;
-        console.log(`${logPrefix} [AUTH] ✓ Subscriber authenticated (${usernameStr}, role: ${role})`);
+        console.log(`${logPrefix} [AUTH] ✓ Subscriber authenticated (${usernameStr}, role: ${role}, connections: ${activeConns.size}/${maxConn})`);
         (client as any).clientType = ClientType.SUBSCRIBER;
         (client as any).username = usernameStr;
         (client as any).role = role;
@@ -742,6 +778,18 @@ aedes.on('clientDisconnect', (client) => {
   // Log additional info to debug why this client disconnected
   if (client) {
     console.log(`${logPrefix} [CLIENT] Disconnect details - clientType: ${(client as any).clientType}, publicKey: ${(client as any).publicKey?.substring(0, 8)}`);
+    
+    // Clean up subscriber connection tracking
+    const clientType = (client as any).clientType;
+    const username = (client as any).username;
+    if (clientType === ClientType.SUBSCRIBER && username) {
+      const activeConns = subscriberActiveConnections.get(username);
+      if (activeConns) {
+        activeConns.delete(client.id);
+        const maxConn = subscriberMaxConnections.get(username) || subscriberConfig.defaultMaxConnections;
+        console.log(`${logPrefix} [CLIENT] Subscriber connection removed (${username}, connections: ${activeConns.size}/${maxConn})`);
+      }
+    }
   }
 });
 
