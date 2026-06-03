@@ -373,7 +373,7 @@ aedes.authorizePublish = (client, packet, callback) => {
     if (ALLOWED_REGIONS && !isTestRegion) {
       const normalizedRegion = locationCode.toUpperCase();
       if (!ALLOWED_REGIONS.includes(normalizedRegion)) {
-        console.log(`${logPrefix} [AUTHZ] ✗ Publish denied -> ${packet.topic} (region ${normalizedRegion} not in allowed list: ${ALLOWED_REGIONS.join(', ')})`);
+        console.debug(`${logPrefix} [AUTHZ] ✗ Publish denied -> ${packet.topic} (region ${normalizedRegion} not in allowed list: ${ALLOWED_REGIONS.join(', ')})`);
         callback(new Error(`Region ${normalizedRegion} is not allowed on this broker`));
         return;
       }
